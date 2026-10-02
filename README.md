@@ -288,6 +288,15 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
   `waitlist_application_ids` / `waitlist_entries`。
 - `GET /api/revision/{n}` 还原修订号 **n 当时**的批准、暂停、恢复、撤销记录、
   **当时生效的保护带宽**及带宽变更记录（`n` 超过当前修订号返回 404）。
+- `GET /api/revision/compare?base_revision={a}&target_revision={b}`
+  对两个已存在修订号做只读复核。返回两侧保护带宽、有效/暂停许可集合及增删集合、
+  区间内按修订号排序的 `approval` / `suspension` / `resumption` / `revocation` /
+  `guard_band_change` 事件（合并字段为 `differences`；各类事件也分别在
+  `approvals`、`suspensions`、`resumptions`、`revocations`、
+  `guard_band_changes` 中返回）、逐次 `status_changes`，其中审批事件保留
+  `auto_approved` 与 `release_revision`。可选 `application_id` 只筛选该申请的
+  许可事件（保护带宽变更仍返回）；未知申请返回 404。该接口只读取事件表，不修改
+  申请、许可、候补队列或修订号。
 
 ### 保护带宽的在线调整
 
@@ -334,6 +343,7 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | `GET` | `/api/waitlist` | 查询整条候补队列（FIFO）与当前修订号 |
 | `GET` | `/api/applications/{id}/waitlist` | 查询单个申请的候补位置 |
 | `GET` | `/api/revision/current` | 当前修订号 + 当前带宽 + 有效集合 + 候补队列 + 全部事件 |
+| `GET` | `/api/revision/compare` | 比较两个已存在修订号的带宽、许可集合、状态与按事件顺序的差异（只读） |
 | `GET` | `/api/revision/{revision}` | 按修订号还原当时的批准/撤销记录与当时带宽 |
 | `GET` | `/api/config/guard-band` | 当前生效带宽、初始带宽与当前修订号 |
 | `POST` | `/api/config/guard-band/preview` | 拟定带宽预览（新带宽下有效许可间的干扰对；不改状态） |

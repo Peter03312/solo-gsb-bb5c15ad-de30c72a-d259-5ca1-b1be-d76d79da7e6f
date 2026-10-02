@@ -20,6 +20,7 @@ GET    /api/waitlist                     the FIFO standby queue
 GET    /api/applications/{id}/waitlist   one standby position
 GET    /api/revision/current             current revision + effective set
 GET    /api/revision/{revision}          as-of snapshot (all event types)
+GET    /api/revision/compare             compare two as-of revision snapshots
 GET    /api/config/guard-band            live guard band + current revision
 POST   /api/config/guard-band/preview    dry-run a proposed band (non-mutating)
 POST   /api/config/guard-band            confirm a new band (expected rev.)
@@ -544,6 +545,214 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
     }
 
 
+def _snapshot_status_map(snapshot: dict[str, Any]) -> dict[int, str]:
+    """Latest grant status represented by an as-of snapshot.
+
+    Applications without a lifecycle event at or before the revision are not
+    grants yet and are treated by callers as ``pending`` where relevant.
+    """
+    statuses: dict[int, str] = {}
+    for approval in snapshot["approvals"]:
+        statuses[approval["application_id"]] = approval["status_as_of"]
+    return statuses
+
+
+def build_revision_comparison(
+    session,
+    base_revision: int,
+    target_revision: int,
+    application_id: int | None = None,
+) -> dict[str, Any]:
+    """Compare two immutable as-of revision snapshots without mutating state.
+
+    The two revisions may be supplied in either chronological direction.  The
+    event interval is the half-open span ``(older, newer]`` (matching the
+    existing rule that snapshot N includes every event with revision <= N);
+    the ``base``/``target`` views retain the caller's labels, while
+    ``status_changes`` and ``differences`` follow chronological event order.
+    """
+    older_revision = min(base_revision, target_revision)
+    newer_revision = max(base_revision, target_revision)
+    older = build_snapshot(session, older_revision)
+    newer = build_snapshot(session, newer_revision)
+
+    # When base is the older revision, these references are already in the
+    # caller's base/target order; otherwise swap them while retaining the
+    # caller's revision labels in the returned base/target views.
+    if base_revision == older_revision:
+        base_snapshot, target_snapshot = older, newer
+    else:
+        base_snapshot, target_snapshot = newer, older
+
+    base_effective = set(base_snapshot["effective_application_ids"])
+    target_effective = set(target_snapshot["effective_application_ids"])
+    base_suspended = set(base_snapshot["suspended_application_ids"])
+    target_suspended = set(target_snapshot["suspended_application_ids"])
+
+    def in_scope(app_id: int) -> bool:
+        return application_id is None or app_id == application_id
+
+    events: list[dict[str, Any]] = []
+
+    approvals: list[dict[str, Any]] = []
+    for event in newer["approvals"]:
+        if event["revision"] <= older_revision or not in_scope(
+            event["application_id"]
+        ):
+            continue
+        record = dict(event)
+        record["type"] = "approval"
+        approvals.append(record)
+        events.append(record)
+
+    suspensions: list[dict[str, Any]] = []
+    for event in newer["suspensions"]:
+        if event["revision"] <= older_revision or not in_scope(
+            event["application_id"]
+        ):
+            continue
+        record = dict(event)
+        record["type"] = "suspension"
+        suspensions.append(record)
+        events.append(record)
+
+    resumptions: list[dict[str, Any]] = []
+    for event in newer["resumptions"]:
+        if event["revision"] <= older_revision or not in_scope(
+            event["application_id"]
+        ):
+            continue
+        record = dict(event)
+        record["type"] = "resumption"
+        resumptions.append(record)
+        events.append(record)
+
+    revocations: list[dict[str, Any]] = []
+    for event in newer["revocations"]:
+        if event["revision"] <= older_revision or not in_scope(
+            event["application_id"]
+        ):
+            continue
+        record = dict(event)
+        record["type"] = "revocation"
+        revocations.append(record)
+        events.append(record)
+
+    guard_band_changes: list[dict[str, Any]] = []
+    for event in newer["guard_band_changes"]:
+        if event["revision"] <= older_revision:
+            continue
+        record = dict(event)
+        record["type"] = "guard_band_change"
+        guard_band_changes.append(record)
+        events.append(record)
+
+    events.sort(key=lambda event: event["revision"])
+
+    interval_statuses = _snapshot_status_map(older)
+    status_changes = []
+    for event in events:
+        app_id = event.get("application_id")
+        if app_id is None:
+            continue
+        before = interval_statuses.get(app_id, "pending")
+        if event["type"] == "approval" or event["type"] == "resumption":
+            after = "approved"
+        elif event["type"] == "suspension":
+            after = "suspended"
+        elif event["type"] == "revocation":
+            after = "revoked"
+        else:
+            continue
+        if before != after:
+            status_changes.append(
+                {
+                    "revision": event["revision"],
+                    "application_id": app_id,
+                    "from_status": before,
+                    "to_status": after,
+                }
+            )
+            interval_statuses[app_id] = after
+
+    base_statuses = _snapshot_status_map(base_snapshot)
+    target_statuses = _snapshot_status_map(target_snapshot)
+
+    base_effective_added = sorted(target_effective - base_effective)
+    base_effective_removed = sorted(base_effective - target_effective)
+    base_suspended_added = sorted(target_suspended - base_suspended)
+    base_suspended_removed = sorted(base_suspended - target_suspended)
+
+    def revision_view(
+        snapshot: dict[str, Any], statuses: dict[int, str]
+    ) -> dict[str, Any]:
+        view = {
+            "revision": snapshot["revision"],
+            "guard_band": snapshot["guard_band"],
+            "effective_application_ids": snapshot["effective_application_ids"],
+            "suspended_application_ids": snapshot[
+                "suspended_application_ids"
+            ],
+        }
+        if application_id is not None:
+            view["application_id"] = application_id
+            view["application_status"] = statuses.get(
+                application_id, "pending"
+            )
+            view["is_effective"] = application_id in set(
+                snapshot["effective_application_ids"]
+            )
+            view["is_suspended"] = application_id in set(
+                snapshot["suspended_application_ids"]
+            )
+        return view
+
+    return {
+        "base_revision": base_revision,
+        "target_revision": target_revision,
+        "older_revision": older_revision,
+        "newer_revision": newer_revision,
+        "direction": (
+            "forward" if target_revision >= base_revision else "backward"
+        ),
+        "application_id": application_id,
+        "base": revision_view(base_snapshot, base_statuses),
+        "target": revision_view(target_snapshot, target_statuses),
+        "guard_band": {
+            "base": base_snapshot["guard_band"],
+            "target": target_snapshot["guard_band"],
+            "changed": (
+                base_snapshot["guard_band"]
+                != target_snapshot["guard_band"]
+            ),
+        },
+        "effective_application_ids": {
+            "base": sorted(base_effective),
+            "target": sorted(target_effective),
+            "added": base_effective_added,
+            "removed": base_effective_removed,
+            "added_to_target": base_effective_added,
+            "removed_from_base": base_effective_removed,
+        },
+        "suspended_application_ids": {
+            "base": sorted(base_suspended),
+            "target": sorted(target_suspended),
+            "added": base_suspended_added,
+            "removed": base_suspended_removed,
+            "added_to_target": base_suspended_added,
+            "removed_from_base": base_suspended_removed,
+        },
+        "status_changes": status_changes,
+        "approvals": approvals,
+        "suspensions": suspensions,
+        "resumptions": resumptions,
+        "revocations": revocations,
+        "guard_band_changes": guard_band_changes,
+        "differences": events,
+        "events": events,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Application factory / lifespan
 # --------------------------------------------------------------------------- #
@@ -647,6 +856,69 @@ def current_revision() -> dict[str, Any]:
         "revocations": snapshot["revocations"],
         "guard_band_changes": snapshot["guard_band_changes"],
     }
+
+
+@app.get("/api/revision/compare", tags=["revision"])
+def compare_revisions(
+    base_revision: int,
+    target_revision: int,
+    application_id: int | None = None,
+) -> dict[str, Any]:
+    """Compare two existing, as-of revision snapshots.
+
+    This is a read-only audit view: it reconstructs both sides with
+    :func:`build_snapshot` and never writes applications, events or revision
+    metadata.  Both revision numbers must exist (zero through the current
+    revision), and the optional application filter must identify a known
+    application.
+    """
+    with SessionLocal() as session:
+        current = session.get(RevisionMeta, 1).revision
+        negative = [
+            revision
+            for revision in (base_revision, target_revision)
+            if revision < 0
+        ]
+        if negative:
+            raise APIError(
+                E_REVISION_OUT_OF_RANGE,
+                "revision must be >= 0",
+                status_code=422,
+                details={"invalid_revisions": negative},
+            )
+        if application_id is not None and application_id < 1:
+            raise APIError(
+                E_VALIDATION,
+                "application_id must be >= 1",
+                status_code=422,
+            )
+        invalid = [
+            revision
+            for revision in (base_revision, target_revision)
+            if revision > current
+        ]
+        if invalid:
+            raise APIError(
+                E_REVISION_OUT_OF_RANGE,
+                f"revision(s) {invalid} are in the future; current revision "
+                f"is {current}",
+                status_code=404,
+                details={
+                    "current_revision": current,
+                    "out_of_range_revisions": invalid,
+                },
+            )
+        if application_id is not None:
+            row = session.get(Application, application_id)
+            if row is None:
+                raise APIError(
+                    E_NOT_FOUND,
+                    f"application {application_id} does not exist",
+                    status_code=404,
+                )
+        return build_revision_comparison(
+            session, base_revision, target_revision, application_id
+        )
 
 
 @app.get("/api/revision/{revision}", tags=["revision"])
