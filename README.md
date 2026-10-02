@@ -40,6 +40,17 @@
   修订号，响应列出本次自动获批与仍候补的申请 ID、未获批的冲突明细及最终修订号；
   释放失败或事务回滚时队列、许可与修订号均不变。历史按各修订号逐项还原自动审批
   结果（标记 `auto_approved` 与触发它的释放修订号）
+- **修订号对比（只读复核）**：`GET /api/revision/diff?base_revision=b&target_revision=t[&application_id=id]`
+  在同一申请库中比较两个**已存在**的修订号，输出两侧的保护带宽、有效/暂停许可集合
+  （含集合增删与共有 ID）、逐申请的**状态变化**（`pending`/`approved`/`suspended`/
+  `revoked` 及暂停/撤销所在修订号）、窗口内全部审批事件（**保留候补自动审批的
+  `auto_approved` 与 `release_revision` 标记**）、暂停/恢复/撤销与带宽变更事件，以及
+  按修订号合并排序的**事件时间线**（`(base, target]` 半开区间；每项附 `present_in`/
+  `absent_in` 指明出现在哪一侧）。基准可比目标新（`direction: "backward"`）；可选
+  `application_id` 把事件、状态变化与逐申请小节限定到单笔申请（全局带宽与集合差异
+  仍照常给出）。比较**不修改任何状态**，两版快照均由与
+  `GET /api/revision/{n}` 相同的历史快照规则还原；修订号为负（422）、超过当前修订号
+  （404 `revision_out_of_range`）或申请 ID 未知（404 `not_found`）均明确报错
 
 ---
 
@@ -86,7 +97,7 @@ export GUARD_BAND="2.0"
 uvicorn app.main:app --reload
 ```
 
-运行测试（自动使用临时 SQLite 库，共 124 个用例）：
+运行测试（自动使用临时 SQLite 库，共 138 个用例）：
 
 ```bash
 pip install -r requirements-dev.txt
@@ -334,6 +345,7 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | `GET` | `/api/waitlist` | 查询整条候补队列（FIFO）与当前修订号 |
 | `GET` | `/api/applications/{id}/waitlist` | 查询单个申请的候补位置 |
 | `GET` | `/api/revision/current` | 当前修订号 + 当前带宽 + 有效集合 + 候补队列 + 全部事件 |
+| `GET` | `/api/revision/diff` | **两修订号对比**（只读；两侧带宽/有效与暂停集合/状态变化/含候补自动审批标记的审批事件/按事件顺序的时间线；可选 `application_id` 过滤） |
 | `GET` | `/api/revision/{revision}` | 按修订号还原当时的批准/撤销记录与当时带宽 |
 | `GET` | `/api/config/guard-band` | 当前生效带宽、初始带宽与当前修订号 |
 | `POST` | `/api/config/guard-band/preview` | 拟定带宽预览（新带宽下有效许可间的干扰对；不改状态） |
@@ -350,7 +362,7 @@ API 不关心具体单位（坐标与半径同理，如均为米）。
 | --- | --- | --- |
 | 422 | `validation_failed` | 提交/参数校验失败（整笔拒收，`details` 为全部违例）；整组列表为空或含重复 ID 时同样 422，明细码为 `duplicate_application_id`；拟定带宽非有限数（`value_not_finite`）或为负（`guard_band_negative`）；候选下界区间非有限（`value_not_finite`）或倒置（`candidate_low_min_above_max`） |
 | 404 | `not_found` | 申请不存在（整组时 `details.missing_application_ids` 列出全部无效 ID） |
-| 404 | `revision_out_of_range` | 查询了未来修订号 |
+| 404 | `revision_out_of_range` | 查询了未来修订号；两修订号对比时任一修订号超过当前修订号（`details` 指明是哪一个） |
 | 409 | `not_pending` | 批准已处理申请 / 撤销待审批申请 / 对非待审批申请查询可用位置（整组时 `details.applications` 列出每项状态） |
 | 409 | `already_revoked` | 重复撤销（整组中混入已撤销申请时同样返回，明细同 `not_pending` 结构）；对已撤销许可暂停或恢复 |
 | 409 | `not_approved` | 对**待审批**申请暂停（只有已获批且未撤销的许可可以暂停） |
@@ -991,6 +1003,101 @@ curl -s http://localhost:8000/api/revision/4
 （`./examples/walkthrough.sh http://localhost:8000`），其中第 26–31 步为
 暂停 / 恢复走查、第 32–37 步为候补队列完整走查。
 
+### 6.18 修订号对比：复核一次审批 / 暂停 / 恢复 / 撤销 / 带宽变更的差异
+
+`GET /api/revision/diff` 只读比较两个**已存在**的修订号，常用于复核某次操作
+前后到底变了什么。下例中：修订号 1 批准了 A，2 暂停 A（同时候补 B 自动获批于
+修订号 3），4 又把保护带宽从 2 MHz 调整为 1 MHz。
+
+```bash
+curl -s 'http://localhost:8000/api/revision/diff?base_revision=1&target_revision=4'
+```
+
+```json
+{
+  "base_revision": 1, "target_revision": 4, "current_revision": 4,
+  "direction": "forward", "filtered": false,
+  "base": {"revision": 1, "guard_band": 2.0,
+           "effective_application_ids": [1], "suspended_application_ids": [],
+           "effective_applications": [ ...完整申请对象... ]},
+  "target": {"revision": 4, "guard_band": 1.0,
+             "effective_application_ids": [2], "suspended_application_ids": [1],
+             "suspended_applications": [ ...]},
+  "guard_band": {"base": 2.0, "target": 1.0, "changed": true},
+  "effective_set_diff": {"added_application_ids": [2],
+                         "removed_application_ids": [1],
+                         "shared_application_ids": []},
+  "suspended_set_diff": {"added_application_ids": [1],
+                         "removed_application_ids": [],
+                         "shared_application_ids": []},
+  "status_changes": [
+    {"application_id": 1, "base_status": "approved",
+     "target_status": "suspended", "target_marker_revision": 2},
+    {"application_id": 2, "base_status": "pending",
+     "target_status": "approved"}
+  ],
+  "approvals": [
+    {"revision": 3, "application_id": 2, "guard_band": 2.0,
+     "auto_approved": true, "release_revision": 2,
+     "status_as_of": "approved", ...}
+  ],
+  "suspensions": [{"revision": 2, "application_id": 1, "type": "suspension", ...}],
+  "resumptions": [],
+  "revocations": [],
+  "guard_band_changes": [{"revision": 4, "previous_guard_band": 2.0,
+                          "guard_band": 1.0, ...}],
+  "events": [
+    {"revision": 2, "type": "suspension", "application_id": 1,
+     "present_in": "target", "absent_in": "base", ...},
+    {"revision": 3, "type": "approval", "application_id": 2,
+     "auto_approved": true, "release_revision": 2,
+     "present_in": "target", "absent_in": "base", ...},
+    {"revision": 4, "type": "guard_band_change",
+     "present_in": "target", "absent_in": "base", ...}
+  ],
+  "event_count": 3
+}
+```
+
+要点：
+
+- **半开窗口**：事件区间为 `(base, target]`，基准修订号自己的事件不计入；
+  比较同一修订号时所有差异列表为空。
+- **集合差异恒为 target 减 base**：`added_application_ids` 是“目标有、基准无”，
+  与方向无关。基准比目标新时 `direction` 为 `"backward"`，时间线每项的
+  `present_in` 变为 `"base"`、`absent_in` 变为 `"target"`。
+- **窗口内获批又撤销**：申请在两端状态相同则不进 `status_changes`，但中间发生
+  的批准 / 撤销事件仍在时间线中（如 A 经历 approved → suspended → approved，
+  状态变化列表不含 A，但暂停与恢复事件照常列出）。
+- **候补自动审批标记**：窗口内的自动批准记录保留 `auto_approved: true` 与
+  `release_revision`，与历史快照完全一致。
+- **可选申请过滤**：加 `&application_id=1` 后，`approvals`/`suspensions`/
+  `resumptions`/`revocations`、`status_changes` 与合并时间线只含该申请自身的
+  生命周期事件（全局的带宽变更事件仍保留），并附 `application_diff` 小节给出
+  该申请在两侧的状态、是否有效/暂停及其状态变化。
+- **只读**：对比不产生任何修订号、不改申请状态与队列。
+
+```bash
+# 只复核申请 1 的差异
+curl -s 'http://localhost:8000/api/revision/diff?base_revision=1&target_revision=4&application_id=1'
+# {"filtered": true, "application_diff": {"application_id": 1,
+#   "base_status": "approved", "target_status": "suspended", ...}, ...}
+
+# 反向比较（基准 4、目标 1）
+curl -s 'http://localhost:8000/api/revision/diff?base_revision=4&target_revision=1'
+# {"direction": "backward", "events": [{"revision": 2, "present_in": "base", ...}, ...]}
+
+# 错误情形
+curl -i 'http://localhost:8000/api/revision/diff?base_revision=0&target_revision=999'
+# HTTP 404 {"error": {"code": "revision_out_of_range",
+#   "details": {"target_revision": 999, "current_revision": 4}}}
+curl -i 'http://localhost:8000/api/revision/diff?base_revision=-1&target_revision=0'
+# HTTP 422 {"error": {"code": "revision_out_of_range",
+#   "details": {"field": "base_revision", "base_revision": -1}}}
+curl -i 'http://localhost:8000/api/revision/diff?base_revision=0&target_revision=4&application_id=999'
+# HTTP 404 {"error": {"code": "not_found", ...}}
+```
+
 ---
 
 ## 7. 项目结构
@@ -1006,7 +1113,7 @@ curl -s http://localhost:8000/api/revision/4
 │   ├── db.py                   # 引擎、等待数据库、建表与旧库列升级、修订号与带宽初值初始化（重启不覆盖）
 │   ├── config.py               # 环境变量配置（GUARD_BAND 仅作建库初值）
 │   └── errors.py               # 统一错误信封
-├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite，含 test_waitlist.py 候补用例）
+├── tests/                      # 裁决单元测试 + API 端到端测试（SQLite，含 test_waitlist.py 候补用例与 test_revision_diff.py 修订对比用例）
 ├── examples/walkthrough.sh     # curl 走查脚本
 ├── Dockerfile
 ├── docker-compose.yml          # db + api 一键启动

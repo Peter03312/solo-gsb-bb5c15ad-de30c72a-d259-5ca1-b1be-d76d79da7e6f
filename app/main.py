@@ -19,6 +19,7 @@ POST   /api/applications/{id}/waitlist/cancel
 GET    /api/waitlist                     the FIFO standby queue
 GET    /api/applications/{id}/waitlist   one standby position
 GET    /api/revision/current             current revision + effective set
+GET    /api/revision/diff                compare two existing revisions
 GET    /api/revision/{revision}          as-of snapshot (all event types)
 GET    /api/config/guard-band            live guard band + current revision
 POST   /api/config/guard-band/preview    dry-run a proposed band (non-mutating)
@@ -545,6 +546,100 @@ def build_snapshot(session, revision: int) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# Revision diff (compare two existing snapshots; never mutates state)
+# --------------------------------------------------------------------------- #
+def snapshot_grant_states(
+    snapshot: dict[str, Any],
+) -> dict[int, tuple[str, int | None]]:
+    """Map every granted application to its status as of a snapshot.
+
+    Status is taken from the approval records already replayed by
+    ``build_snapshot`` so the diff follows exactly the same historical
+    snapshot rules: ``approved`` / ``suspended`` (with the suspension
+    revision) / ``revoked`` (with the revocation revision).  Applications
+    that were never approved at that revision are not in the map.
+    """
+    states: dict[int, tuple[str, int | None]] = {}
+    for record in snapshot["approvals"]:
+        marker: int | None = None
+        if record["status_as_of"] == "revoked":
+            marker = record.get("revoked_at_revision")
+        elif record["status_as_of"] == "suspended":
+            marker = record.get("suspended_at_revision")
+        states[record["application_id"]] = (record["status_as_of"], marker)
+    return states
+
+
+def window_events(
+    upper: dict[str, Any], lower_revision: int
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Typed events applied strictly after ``lower_revision`` up to the
+    higher snapshot's revision.
+
+    Returns (approvals, lifecycle, guard_band_changes) copied from the
+    already-reconstructed higher snapshot, so every record has the same
+    shape as ``GET /api/revision/{revision}`` (approvals keep their
+    ``status_as_of``/``auto_approved``/``release_revision`` flags).  The
+    window is half-open: the event of the lower revision itself is excluded,
+    matching "what happened between the two revisions".
+    """
+    approvals = [
+        dict(record)
+        for record in upper["approvals"]
+        if record["revision"] > lower_revision
+    ]
+    lifecycle: list[dict[str, Any]] = []
+    for kind, key in (
+        ("suspension", "suspensions"),
+        ("resumption", "resumptions"),
+        ("revocation", "revocations"),
+    ):
+        for record in upper[key]:
+            if record["revision"] > lower_revision:
+                item = dict(record)
+                item["type"] = kind
+                lifecycle.append(item)
+    lifecycle.sort(key=lambda item: item["revision"])
+    guard_changes = [
+        dict(record)
+        for record in upper["guard_band_changes"]
+        if record["revision"] > lower_revision
+    ]
+    return approvals, lifecycle, guard_changes
+
+
+def ordered_timeline(
+    approvals: list[dict[str, Any]],
+    lifecycle: list[dict[str, Any]],
+    guard_changes: list[dict[str, Any]],
+    forward: bool,
+) -> list[dict[str, Any]]:
+    """All window events in revision order, tagged with where each appears.
+
+    ``present_in``/``absent_in`` name the snapshot the event is present in /
+    absent from.  Comparing a revision with itself yields an empty list.
+    """
+    present = "target" if forward else "base"
+    absent = "base" if forward else "target"
+    timeline: list[dict[str, Any]] = []
+    for record in approvals:
+        item = dict(record)
+        item["type"] = "approval"
+        timeline.append(item)
+    for record in lifecycle:
+        timeline.append(dict(record))
+    for record in guard_changes:
+        item = dict(record)
+        item["type"] = "guard_band_change"
+        timeline.append(item)
+    timeline.sort(key=lambda item: item["revision"])
+    for item in timeline:
+        item["present_in"] = present
+        item["absent_in"] = absent
+    return timeline
+
+
+# --------------------------------------------------------------------------- #
 # Application factory / lifespan
 # --------------------------------------------------------------------------- #
 @asynccontextmanager
@@ -647,6 +742,287 @@ def current_revision() -> dict[str, Any]:
         "revocations": snapshot["revocations"],
         "guard_band_changes": snapshot["guard_band_changes"],
     }
+
+
+@app.get("/api/revision/diff", tags=["revision"])
+def revision_diff(
+    base_revision: int,
+    target_revision: int,
+    application_id: int | None = None,
+) -> dict[str, Any]:
+    """Compare two existing revisions (read-only).
+
+    Reconstructs both snapshots with the same rules as
+    ``GET /api/revision/{revision}`` and reports:
+
+    * the guard band at each revision;
+    * the effective and suspended license sets at each revision and the
+      IDs added/removed in each direction (effective and suspended);
+    * per-application status changes (``approved``/``suspended``/
+      ``revoked``, including the suspension or revocation revision);
+    * approval events of the window, keeping the ``auto_approved`` waitlist
+      flag and the triggering ``release_revision``;
+    * suspension/resumption/revocation events and guard-band changes of the
+      window;
+    * the whole window merged as one event-ordered timeline.
+
+    The base revision may be either side of the target: when the target is
+    the older revision, every set difference is still computed as
+    target-minus-base and ``direction`` is ``"backward"`` (each timeline
+    event names via ``present_in``/``absent_in`` which snapshot contains
+    it).  An optional ``application_id`` scopes the events, status changes
+    and per-application section to one application (the global guard band
+    is still compared, and set diffs remain global).  No state is ever
+    modified; both revisions must exist (>= 0 and <= the current
+    revision), and an unknown application ID is rejected.
+    """
+    for name, value in (
+        ("base_revision", base_revision),
+        ("target_revision", target_revision),
+    ):
+        if value < 0:
+            raise APIError(
+                E_REVISION_OUT_OF_RANGE,
+                f"{name} must be >= 0",
+                status_code=422,
+                details={"field": name, name: value},
+            )
+
+    with SessionLocal() as session:
+        current = session.get(RevisionMeta, 1).revision
+        for name, value in (
+            ("base_revision", base_revision),
+            ("target_revision", target_revision),
+        ):
+            if value > current:
+                raise APIError(
+                    E_REVISION_OUT_OF_RANGE,
+                    f"{name} {value} is in the future; current revision is "
+                    f"{current}",
+                    status_code=404,
+                    details={
+                        name: value,
+                        "current_revision": current,
+                    },
+                )
+
+        focused_app = None
+        if application_id is not None:
+            focused_app = session.get(Application, application_id)
+            if focused_app is None:
+                raise APIError(
+                    E_NOT_FOUND,
+                    f"application {application_id} does not exist",
+                    status_code=404,
+                )
+
+        base_snapshot = build_snapshot(session, base_revision)
+        target_snapshot = build_snapshot(session, target_revision)
+
+        forward = target_revision >= base_revision
+        lower_revision = min(base_revision, target_revision)
+        upper_snapshot = target_snapshot if forward else base_snapshot
+
+        base_effective = set(base_snapshot["effective_application_ids"])
+        target_effective = set(target_snapshot["effective_application_ids"])
+        base_suspended = set(base_snapshot["suspended_application_ids"])
+        target_suspended = set(target_snapshot["suspended_application_ids"])
+
+        approvals_window, lifecycle_window, guard_window = window_events(
+            upper_snapshot, lower_revision
+        )
+        timeline = ordered_timeline(
+            approvals_window,
+            lifecycle_window,
+            guard_window,
+            forward=forward,
+        )
+
+        # Per-application status changes.  Any application granted at either
+        # snapshot is a candidate; a grant applied and then revoked within
+        # the window ends with the same status at both sides and is skipped.
+        base_states = snapshot_grant_states(base_snapshot)
+        target_states = snapshot_grant_states(target_snapshot)
+        status_changes: list[dict[str, Any]] = []
+        for app_id in sorted(set(base_states) | set(target_states)):
+            base_state, base_marker = base_states.get(
+                app_id, ("pending", None)
+            )
+            target_state, target_marker = target_states.get(
+                app_id, ("pending", None)
+            )
+            if base_state == target_state:
+                continue
+            change = {
+                "application_id": app_id,
+                "base_status": base_state,
+                "target_status": target_state,
+            }
+            if base_marker is not None:
+                change["base_marker_revision"] = base_marker
+            if target_marker is not None:
+                change["target_marker_revision"] = target_marker
+            status_changes.append(change)
+
+        def side_view(snapshot: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "revision": snapshot["revision"],
+                "guard_band": snapshot["guard_band"],
+                "effective_application_ids": snapshot[
+                    "effective_application_ids"
+                ],
+                "suspended_application_ids": snapshot[
+                    "suspended_application_ids"
+                ],
+                "effective_applications": [
+                    serialize_application(app)
+                    for app_id in snapshot["effective_application_ids"]
+                    if (app := session.get(Application, app_id)) is not None
+                ],
+                "suspended_applications": [
+                    serialize_application(app)
+                    for app_id in snapshot["suspended_application_ids"]
+                    if (app := session.get(Application, app_id)) is not None
+                ],
+            }
+
+        response: dict[str, Any] = {
+            "base_revision": base_revision,
+            "target_revision": target_revision,
+            "current_revision": current,
+            "direction": "forward" if forward else "backward",
+            "base": side_view(base_snapshot),
+            "target": side_view(target_snapshot),
+            "guard_band": {
+                "base": base_snapshot["guard_band"],
+                "target": target_snapshot["guard_band"],
+                "changed": (
+                    base_snapshot["guard_band"]
+                    != target_snapshot["guard_band"]
+                ),
+            },
+            "effective_set_diff": {
+                # IDs whose license is effective at the target but not at
+                # the base (and vice versa), regardless of direction.
+                "added_application_ids": sorted(
+                    target_effective - base_effective
+                ),
+                "removed_application_ids": sorted(
+                    base_effective - target_effective
+                ),
+                "shared_application_ids": sorted(
+                    base_effective & target_effective
+                ),
+            },
+            "suspended_set_diff": {
+                "added_application_ids": sorted(
+                    target_suspended - base_suspended
+                ),
+                "removed_application_ids": sorted(
+                    base_suspended - target_suspended
+                ),
+                "shared_application_ids": sorted(
+                    base_suspended & target_suspended
+                ),
+            },
+            "status_changes": status_changes,
+            "approvals": approvals_window,
+            "suspensions": [
+                item
+                for item in lifecycle_window
+                if item["type"] == "suspension"
+            ],
+            "resumptions": [
+                item
+                for item in lifecycle_window
+                if item["type"] == "resumption"
+            ],
+            "revocations": [
+                item
+                for item in lifecycle_window
+                if item["type"] == "revocation"
+            ],
+            "guard_band_changes": guard_window,
+            "events": timeline,
+            "event_count": len(timeline),
+        }
+
+        if application_id is not None:
+            event_types = {
+                "approval",
+                "suspension",
+                "resumption",
+                "revocation",
+            }
+            focused = {
+                "application_id": application_id,
+                "application": serialize_application(focused_app),
+                "base_status": base_states.get(
+                    application_id, ("pending", None)
+                )[0],
+                "target_status": target_states.get(
+                    application_id, ("pending", None)
+                )[0],
+                "base_effective": application_id in base_effective,
+                "target_effective": application_id in target_effective,
+                "base_suspended": application_id in base_suspended,
+                "target_suspended": application_id in target_suspended,
+                "status_change": next(
+                    (
+                        change
+                        for change in status_changes
+                        if change["application_id"] == application_id
+                    ),
+                    None,
+                ),
+                "events": [
+                    item
+                    for item in timeline
+                    if item["type"] in event_types
+                    and item.get("application_id") == application_id
+                ],
+            }
+            response["application_diff"] = focused
+            response["filtered"] = True
+            response["status_changes"] = [
+                change
+                for change in status_changes
+                if change["application_id"] == application_id
+            ]
+            response["approvals"] = [
+                record
+                for record in approvals_window
+                if record["application_id"] == application_id
+            ]
+            response["suspensions"] = [
+                item
+                for item in response["suspensions"]
+                if item["application_id"] == application_id
+            ]
+            response["resumptions"] = [
+                item
+                for item in response["resumptions"]
+                if item["application_id"] == application_id
+            ]
+            response["revocations"] = [
+                item
+                for item in response["revocations"]
+                if item["application_id"] == application_id
+            ]
+            # Guard-band changes are global and stay in the filtered result;
+            # the merged timeline keeps only the focused application's own
+            # lifecycle events plus the global guard-band changes.
+            response["events"] = focused["events"] + [
+                item
+                for item in timeline
+                if item["type"] == "guard_band_change"
+            ]
+            response["events"].sort(key=lambda item: item["revision"])
+            response["event_count"] = len(response["events"])
+        else:
+            response["filtered"] = False
+
+        return response
 
 
 @app.get("/api/revision/{revision}", tags=["revision"])
